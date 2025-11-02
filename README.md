@@ -119,6 +119,19 @@ The generated PDF includes:
 - Clickable video links
 - Professional formatting with page breaks
 
+## Frontend
+
+First use 
+```
+npm i
+```
+
+To run the front end ```cd``` into TREC FE and then into my react-app
+
+```
+npm run dev
+```
+
 ## License
 
 MIT License
