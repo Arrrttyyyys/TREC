@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# TREC Inspection Report PDF Generator — overlap-safe version
+# TREC Inspection Report PDF Generator — header-first overlay + overlap-safe body
 import os, json, re, time, html
 from pathlib import Path
 from io import BytesIO
@@ -12,7 +12,7 @@ from pypdf.generic import NameObject, BooleanObject, ArrayObject
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
-from reportlab.lib.colors import black, white, HexColor
+from reportlab.lib.colors import black, white, HexColor, Color
 from reportlab.lib.utils import ImageReader
 from PIL import Image
 import requests
@@ -220,6 +220,127 @@ def fetch_image(url: str, max_size=(800, 600)) -> Optional[ImageReader]:
         return None
 
 
+# =============== Header-only overlay (does NOT modify widgets) ===============
+def _rect_tuple(rect):
+    x1, y1, x2, y2 = [float(v) for v in rect]
+    left, right = min(x1, x2), max(x1, x2)
+    bottom, top = min(y1, y2), max(y1, y2)
+    return (left, bottom, right, top)
+
+
+def _group_by_rows(rects, y_tol=8.0):
+    rows = []
+    centers = []
+    for r in rects:
+        _, b, _, t = r
+        yc = 0.5 * (b + t)
+        placed = False
+        for i, (row, cy) in enumerate(zip(rows, centers)):
+            if abs(yc - cy) <= y_tol:
+                row.append(r)
+                centers[i] = (cy * len(row) + yc) / (len(row) + 1e-9)
+                placed = True
+                break
+        if not placed:
+            rows.append([r])
+            centers.append(yc)
+    rows = [sorted(row, key=lambda R: R[0]) for row in rows]
+    rows.sort(key=lambda row: -0.5 * (row[0][1] + row[0][3]))
+    return rows
+
+
+def _draw_shrink_to_fit(c, rect, text, fixed_size=11.0, min_size=8.0, pad=3.0):
+    left, bottom, right, top = rect
+    text = html.unescape(text or "")
+    available = max(1.0, right - left - 2 * pad)
+    size = fixed_size
+    while size >= min_size:
+        w = c.stringWidth(text, FIXED_FONT, size)
+        if w <= available:
+            break
+        size -= 0.5
+    c.setFont(FIXED_FONT, size)
+    x = left + pad
+    y = top - 0.65 * (top - bottom)
+    c.drawString(x, y, text)
+
+
+def header_values_list(data: Dict[str, Any]) -> List[str]:
+    addr = getv(data, "address.fullAddress", "")
+    if not addr or addr == "Data not found in test data":
+        parts = [
+            getv(data, "address.street", ""),
+            getv(data, "address.city", ""),
+            getv(data, "address.state", ""),
+            getv(data, "address.zipcode", ""),
+        ]
+        addr = " ".join([p for p in parts if p]) or "Data not found in test data"
+
+    return [
+        str(getv(data, "clientInfo.name")),                 # Name of Client
+        ms_to_iso(getv(data, "schedule.date", None)),       # Date of Inspection
+        str(addr),                                          # Address of Inspected Property
+        str(getv(data, "inspector.name")),                  # Name of Inspector
+        str(getv(data, "inspector.license", "")),           # TREC License #
+        "",                                                 # Name of Sponsor (if applicable)
+        "",                                                 # TREC License # (sponsor)
+    ]
+
+
+def overlay_fill_header_page1(writer: PdfWriter, data: Dict[str, Any]) -> None:
+    """
+    Draws the page-1 header values ON TOP of the existing widgets (does not modify /Annots).
+    """
+    if not writer.pages:
+        return
+    page0 = writer.pages[0]
+    annots = page0.get("/Annots") or []
+
+    # collect /Tx rects in the top band
+    rects = []
+    for a in annots:
+        w = a.get_object()
+        if w.get("/FT") == NameObject("/Tx"):
+            rect = w.get("/Rect")
+            if isinstance(rect, ArrayObject) and len(rect) == 4:
+                r = _rect_tuple(rect)
+                # top quarter of page
+                top = float(page0.mediabox.top)
+                bottom = float(page0.mediabox.bottom)
+                if r[3] > top - (top - bottom) * 0.25:
+                    rects.append(r)
+
+    if not rects:
+        return
+
+    rows = _group_by_rows(rects, y_tol=8.0)
+    ordered_rects = [r for row in rows for r in row]
+
+    values = header_values_list(data)
+    n = min(len(values), len(ordered_rects))
+
+    # Use actual page size (not letter) so scaling stays correct
+    pw = float(page0.mediabox.width)
+    ph = float(page0.mediabox.height)
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=(pw, ph))
+    for i in range(n):
+        _draw_shrink_to_fit(c, ordered_rects[i], values[i], fixed_size=11.0, min_size=8.0, pad=3.0)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+
+    overlay_reader = PdfReader(buf)
+    page0.merge_page(overlay_reader.pages[0])
+
+    # Ensure viewers don't regenerate appearances for filled form fields elsewhere
+    root = writer._root_object
+    acro = root.get("/AcroForm")
+    if acro is not None:
+        acro.update({NameObject("/NeedAppearances"): BooleanObject(False)})
+
+
 # =============== Main PDF fill ===============
 def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path):
     print(f"📄 Template: {template_path}")
@@ -232,10 +353,13 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
     items, media = extract_items_and_media(data)
     print(f"   Items: {len(items)}, media: {len(media)}")
 
-    # Discover widgets we care about
+    # --- Phase 1: fill ONLY the page-1 header (overlay; leaves widgets untouched) ---
+    overlay_fill_header_page1(writer, data)
+
+    # --- Phase 2: proceed with original overlap-safe filling for the rest ---
     checkbox_pat = re.compile(r"CheckBox1\[(\d+)\]$")
     checkboxes = []
-    hdr_fields = []
+    hdr_fields = []      # header-like /Tx fields (excluding page-1 header band)
     comment_fields = []
 
     for pidx, page in enumerate(writer.pages):
@@ -251,42 +375,30 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
             if not isinstance(rect, ArrayObject):
                 continue
 
-            if ftype == NameObject("/Tx"):  # text field
-                # header fields: match by normalized name tail
-                nm = normalize(name_str)
-                matched = None
-                for k in header.keys():
-                    if nm.endswith(k):
-                        matched = k
-                        break
-                if matched:
-                    hdr_fields.append((pidx, rect, a, matched))
-                else:
-                    # candidate comment box? filter by geometry + page
+            if ftype == NameObject("/Tx"):
+                # Skip header band on page 1 entirely (already drawn by overlay)
+                if pidx == 0:
                     rc = rect_coords(rect)
-                    wpx = rc["right"] - rc["left"]
-                    hpx = rc["top"] - rc["bottom"]
-                    # Only keep LARGE boxes (avoid tiny inline widgets)
-                    # Typical comment boxes are > 300 pts wide and > 50 pts high
-                    if wpx >= 300 and hpx >= 50 and pidx in (2,3,4,5):  # pages 3–6 (0-based)
-                        comment_fields.append((pidx, rect, a))
+                    top = float(page.mediabox.top); bottom = float(page.mediabox.bottom)
+                    if rc["top"] > top - (top - bottom) * 0.25:
+                        continue
+
+                # candidate comment box? filter by geometry + page
+                rc = rect_coords(rect)
+                wpx = rc["right"] - rc["left"]
+                hpx = rc["top"] - rc["bottom"]
+                if wpx >= 300 and hpx >= 50 and pidx in (2, 3, 4, 5):  # pages 3–6 (0-based)
+                    comment_fields.append((pidx, rect, a))
+
             elif ftype == NameObject("/Btn") and "CheckBox1[" in name_str:
                 m = checkbox_pat.search(name_str)
                 if m:
                     checkboxes.append((pidx, int(m.group(1)), w))
 
-    print(f"   Header fields: {len(hdr_fields)} | comment boxes: {len(comment_fields)} | checkboxes: {len(checkboxes)}")
+    print(f"   Comment boxes: {len(comment_fields)} | checkboxes: {len(checkboxes)}")
 
     overlays = [[] for _ in range(len(writer.pages))]
-    overflow = []
-
-    # Fill header fields (and remove widgets)
-    for pidx, rect, aref, key in hdr_fields:
-        overlays[pidx].append({"rect": tuple(float(x) for x in rect), "text": header[key], "kind": "header"})
-        page = writer.pages[pidx]
-        ann = page.get("/Annots")
-        if ann:
-            page[NameObject("/Annots")] = ArrayObject([x for x in ann if x != aref])
+    overflow: List[Dict[str, str]] = []
 
     # Set checkboxes in groups of 4 (I, NI, NP, D) in the order they appear
     checkboxes.sort(key=lambda t: (t[0], t[1]))
@@ -311,13 +423,13 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
                 w.update({NameObject("/V"): NameObject("/Off"), NameObject("/AS"): NameObject("/Off")})
         idx += 4
 
-    # Fill comment boxes (largest boxes only), top→bottom by Y
+    # Bind comments to the largest boxes, top→bottom by Y
     comment_fields.sort(key=lambda t: (t[0], -rect_coords(t[1])["top"]))
     max_bind = min(len(items), len(comment_fields))
     for i in range(max_bind):
         it = items[i]
         pidx, rect, aref = comment_fields[i]
-        overlays[pidx].append({"rect": tuple(float(x) for x in rect), "text": it.get("text",""), "kind": "comment", "item": it})
+        overlays[pidx].append({"rect": tuple(float(x) for x in rect), "text": it.get("text", ""), "kind": "comment", "item": it})
         page = writer.pages[pidx]
         ann = page.get("/Annots")
         if ann:
@@ -345,16 +457,18 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
     for pidx in range(len(writer.pages)):
         if not overlays[pidx]:
             continue
+        pw = float(writer.pages[pidx].mediabox.width)
+        ph = float(writer.pages[pidx].mediabox.height)
         buf = BytesIO()
-        c = canvas.Canvas(buf, pagesize=letter)
+        c = canvas.Canvas(buf, pagesize=(pw, ph))
         for ov in overlays[pidx]:
             ok, rest = draw_text_in_rect(c, ov["rect"], ov["text"])
             if (not ok) and rest.strip():
                 it = ov.get("item", {})
                 overflow.append({
-                    "section": it.get("section",""),
-                    "sectionNumber": it.get("sectionNumber",""),
-                    "title": it.get("title",""),
+                    "section": it.get("section", ""),
+                    "sectionNumber": it.get("sectionNumber", ""),
+                    "title": it.get("title", ""),
                     "text": rest
                 })
         c.showPage(); c.save(); buf.seek(0)
@@ -367,8 +481,11 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
 
     # Appendix: overflow + media
     app_buf = BytesIO()
-    c = canvas.Canvas(app_buf, pagesize=letter)
-    W, H = letter
+    # use first page size for consistency with template
+    pw0 = float(writer.pages[0].mediabox.width)
+    ph0 = float(writer.pages[0].mediabox.height)
+    c = canvas.Canvas(app_buf, pagesize=(pw0, ph0))
+    W, H = pw0, ph0
     x, y = 60, H - 60
 
     if overflow:
@@ -378,7 +495,7 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
         c.setFont(FIXED_FONT, FIXED_SIZE)
 
         def block(txt: str, width: float, y0: float) -> float:
-            tb = BytesIO(); tc = canvas.Canvas(tb, pagesize=letter)
+            tb = BytesIO(); tc = canvas.Canvas(tb, pagesize=(pw0, ph0))
             lines = wrap_text(txt, tc, width)
             for ln in lines:
                 if y0 < 60:
@@ -408,16 +525,19 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
         col = 0
 
         for i, m in enumerate(media, start=1):
-            kind, url = m.get("kind"), m.get("url","")
+            kind, url = m.get("kind"), m.get("url", "")
             if kind == "photo":
                 img = fetch_image(url, max_size=MAX_IMAGE_SIZE)
                 if img:
-                    iw, ih = getattr(img, "_image", getattr(img, "image", None)).size
+                    try:
+                        iw, ih = getattr(img, "_image", getattr(img, "image", None)).size
+                    except Exception:
+                        iw, ih = (800, 600)
                     scale = min(col_w/iw, col_h/ih)
-                    rw, rh = iw*scale, ih*scale
+                    rw, rh = iw * scale, ih * scale
                     if y - rh - 18 < 60:
                         c.showPage(); y = H - 60; c.setFont(FIXED_FONT, FIXED_SIZE)
-                        c.setFont("Helvetica-Bold",14); c.drawString(x,y,"Media (in JSON order)")
+                        c.setFont("Helvetica-Bold", 14); c.drawString(x, y, "Media (in JSON order)")
                         y -= 24; c.setFont(FIXED_FONT, FIXED_SIZE); col = 0
                     cx = cols[col]
                     c.setFont("Helvetica-Bold", 10); c.drawString(cx, y, f"M#{i}: photo"); y -= 12
@@ -430,14 +550,14 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
                 else:
                     if y < 70:
                         c.showPage(); y = H - 60; c.setFont(FIXED_FONT, FIXED_SIZE)
-                        c.setFont("Helvetica-Bold",14); c.drawString(x,y,"Media (in JSON order)")
+                        c.setFont("Helvetica-Bold", 14); c.drawString(x, y, "Media (in JSON order)")
                         y -= 24; c.setFont(FIXED_FONT, FIXED_SIZE)
                     c.drawString(x, y, f"M#{i}: photo (unavailable)  {url}")
                     y -= LINE_HEIGHT
             else:
                 if y < 70:
                     c.showPage(); y = H - 60; c.setFont(FIXED_FONT, FIXED_SIZE)
-                    c.setFont("Helvetica-Bold",14); c.drawString(x,y,"Media (in JSON order)")
+                    c.setFont("Helvetica-Bold", 14); c.drawString(x, y, "Media (in JSON order)")
                     y -= 24; c.setFont(FIXED_FONT, FIXED_SIZE)
                 label = f"M#{i}: video"
                 c.setFillColor(HexColor("#0645AD")); c.drawString(x, y, label)
@@ -445,9 +565,8 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
                 c.linkURL(url, (x, y - 2, x + tw, y + 10), relative=0)
                 c.setFillColor(black)
                 y -= LINE_HEIGHT
-                # also print the URL (wrapped) so the link is obvious in printouts
-                tb = BytesIO(); tc = canvas.Canvas(tb, pagesize=letter)
-                for ln in wrap_text(url, tc, (W-120) - (tw + 8)):
+                tb = BytesIO(); tc = canvas.Canvas(tb, pagesize=(pw0, ph0))
+                for ln in wrap_text(url, tc, (W - 120) - (tw + 8)):
                     if y < 60:
                         c.showPage(); y = H - 60; c.setFont(FIXED_FONT, FIXED_SIZE)
                     c.drawString(x + tw + 8, y, ln)
@@ -478,7 +597,7 @@ def main():
     tpl_path = Path(os.environ.get("TREC_TEMPLATE", here / "TREC_Template_Blank.pdf"))
     out_path = Path(os.environ.get("OUT_PATH", here / "TREC_Filled_Output.pdf"))
 
-    print("\n=== TREC Inspection Report PDF Generator (overlap-safe) ===\n")
+    print("\n=== TREC Inspection Report PDF Generator (header-first, overlap-safe) ===\n")
     with open(json_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
     data = raw.get("inspection", raw)
