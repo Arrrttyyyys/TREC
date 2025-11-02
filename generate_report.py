@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# TREC Inspection Report PDF Generator — header-first overlay + overlap-safe body
+# TREC Inspection Report PDF Generator — header-first overlay + overlap-safe body with INLINE MEDIA
 import os, json, re, time, html
 from pathlib import Path
 from io import BytesIO
@@ -29,6 +29,13 @@ BOT_PAD = 6
 MAX_IMAGE_SIZE = (800, 600)
 JPEG_QUALITY = 75
 SKIP_LARGE_IMAGES = True  # skip >5MB
+
+# Inline image sizing in the appendix text flow
+INLINE_IMG_MAX_H = 2.4 * inch
+
+# If you want the raw video URLs to also be printed (in addition to the clickable label),
+# set environment variable SHOW_VIDEO_URLS=1 when running the script.
+SHOW_VIDEO_URLS = os.environ.get("SHOW_VIDEO_URLS", "0") == "1"
 
 I, NI, NP, D = "I", "NI", "NP", "D"
 
@@ -296,7 +303,6 @@ def overlay_fill_header_page1(writer: PdfWriter, data: Dict[str, Any]) -> None:
     page0 = writer.pages[0]
     annots = page0.get("/Annots") or []
 
-    # collect /Tx rects in the top band
     rects = []
     for a in annots:
         w = a.get_object()
@@ -304,7 +310,6 @@ def overlay_fill_header_page1(writer: PdfWriter, data: Dict[str, Any]) -> None:
             rect = w.get("/Rect")
             if isinstance(rect, ArrayObject) and len(rect) == 4:
                 r = _rect_tuple(rect)
-                # top quarter of page
                 top = float(page0.mediabox.top)
                 bottom = float(page0.mediabox.bottom)
                 if r[3] > top - (top - bottom) * 0.25:
@@ -319,7 +324,6 @@ def overlay_fill_header_page1(writer: PdfWriter, data: Dict[str, Any]) -> None:
     values = header_values_list(data)
     n = min(len(values), len(ordered_rects))
 
-    # Use actual page size (not letter) so scaling stays correct
     pw = float(page0.mediabox.width)
     ph = float(page0.mediabox.height)
 
@@ -334,11 +338,144 @@ def overlay_fill_header_page1(writer: PdfWriter, data: Dict[str, Any]) -> None:
     overlay_reader = PdfReader(buf)
     page0.merge_page(overlay_reader.pages[0])
 
-    # Ensure viewers don't regenerate appearances for filled form fields elsewhere
     root = writer._root_object
     acro = root.get("/AcroForm")
     if acro is not None:
         acro.update({NameObject("/NeedAppearances"): BooleanObject(False)})
+
+
+# =============== Inline-media helpers ===============
+MEDIA_TOKEN_RE = re.compile(r"\[M#(\d+)\]")
+
+def build_media_map(media: List[Dict[str, str]]) -> Dict[int, Dict[str, Any]]:
+    """
+    Returns {index -> {'kind': 'photo'|'video', 'url': str, 'img': ImageReader|None}}
+    Index is 1-based (M#1 ...), matching how tokens are created.
+    Photos get pre-fetched; videos keep url only.
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    for i, m in enumerate(media, start=1):
+        kind = m.get("kind")
+        url = m.get("url", "")
+        entry = {"kind": kind, "url": url, "img": None}
+        if kind == "photo":
+            entry["img"] = fetch_image(url, max_size=MAX_IMAGE_SIZE)
+        out[i] = entry
+    return out
+
+
+def draw_inline_richblock(
+    c: canvas.Canvas,
+    text: str,
+    width: float,
+    x: float,
+    y: float,
+    page_w: float,
+    page_h: float,
+    media_map: Dict[int, Dict[str, Any]],
+) -> float:
+    """
+    Draw a paragraph that may contain [M#N] tokens, preserving exact order.
+    - Text between tokens is wrapped to 'width'.
+    - Token M#N:
+        * photo & downloadable -> draw inline image (max height INLINE_IMG_MAX_H)
+        * photo but not downloadable -> short 'photo (unavailable)' line
+        * video -> clickable 'M#N: video' label only (no raw URL unless SHOW_VIDEO_URLS=1)
+    Returns updated y.
+    """
+    def draw_wrapped(chunk: str, y0: float) -> float:
+        if not chunk:
+            return y0
+        c.setFont(FIXED_FONT, FIXED_SIZE)
+        tb = BytesIO(); tc = canvas.Canvas(tb, pagesize=(page_w, page_h))
+        for ln in wrap_text(chunk, tc, width):
+            if y0 < 60:
+                c.showPage(); c.setFont(FIXED_FONT, FIXED_SIZE)
+                y0 = page_h - 60
+            c.drawString(x, y0, ln)
+            y0 -= LINE_HEIGHT
+        return y0
+
+    pos = 0
+    for m in MEDIA_TOKEN_RE.finditer(text):
+        pre = text[pos:m.start()]
+        y = draw_wrapped(pre, y)
+
+        idx = int(m.group(1))
+        meta = media_map.get(idx)
+
+        if y < 70:
+            c.showPage(); c.setFont(FIXED_FONT, FIXED_SIZE)
+            y = page_h - 60
+
+        if not meta:
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(x, y, f"M#{idx}: (missing)")
+            y -= LINE_HEIGHT
+            c.setFont(FIXED_FONT, FIXED_SIZE)
+        else:
+            kind = meta.get("kind")
+            if kind == "photo" and meta.get("img"):
+                img: ImageReader = meta["img"]
+                try:
+                    iw, ih = getattr(img, "_image", getattr(img, "image", None)).size
+                except Exception:
+                    iw, ih = (800, 600)
+                scale = min(width / iw, INLINE_IMG_MAX_H / ih)
+                rw, rh = iw * scale, ih * scale
+
+                if y - rh - 16 < 60:
+                    c.showPage(); c.setFont(FIXED_FONT, FIXED_SIZE)
+                    y = page_h - 60
+
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(x, y, f"M#{idx}: photo")
+                y -= 12
+                c.drawImage(img, x, y - rh, width=rw, height=rh,
+                            preserveAspectRatio=True, mask='auto')
+                y = y - rh - 8
+                c.setFont(FIXED_FONT, FIXED_SIZE)
+
+            elif kind == "video":
+                label = f"M#{idx}: video"
+                url = meta.get("url") or ""
+
+                if y < 70:
+                    c.showPage(); c.setFont(FIXED_FONT, FIXED_SIZE)
+                    y = page_h - 60
+
+                c.setFont("Helvetica-Bold", 10)
+                c.setFillColor(HexColor("#0645AD"))
+                c.drawString(x, y, label)
+                tw = c.stringWidth(label, "Helvetica-Bold", 10)
+                if url:
+                    c.linkURL(url, (x, y - 2, x + tw, y + 10), relative=0)
+                c.setFillColor(black)
+                y -= LINE_HEIGHT
+
+                # Only print the raw URL if explicitly requested
+                if SHOW_VIDEO_URLS and url:
+                    tb = BytesIO(); tc = canvas.Canvas(tb, pagesize=(page_w, page_h))
+                    for ln in wrap_text(url, tc, width):
+                        if y < 60:
+                            c.showPage(); c.setFont(FIXED_FONT, FIXED_SIZE)
+                            y = page_h - 60
+                        c.drawString(x, y, ln)
+                        y -= LINE_HEIGHT
+
+                c.setFont(FIXED_FONT, FIXED_SIZE)
+
+            else:
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(x, y, f"M#{idx}: photo (unavailable)")
+                y -= LINE_HEIGHT
+                c.setFont(FIXED_FONT, FIXED_SIZE)
+
+        pos = m.end()
+
+    tail = text[pos:]
+    y = draw_wrapped(tail, y)
+    return y
 
 
 # =============== Main PDF fill ===============
@@ -359,7 +496,6 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
     # --- Phase 2: proceed with original overlap-safe filling for the rest ---
     checkbox_pat = re.compile(r"CheckBox1\[(\d+)\]$")
     checkboxes = []
-    hdr_fields = []      # header-like /Tx fields (excluding page-1 header band)
     comment_fields = []
 
     for pidx, page in enumerate(writer.pages):
@@ -479,14 +615,16 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
     for it in items[max_bind:]:
         overflow.append(it)
 
-    # Appendix: overflow + media
+    # -------- Appendix: overflow with INLINE MEDIA --------
     app_buf = BytesIO()
-    # use first page size for consistency with template
     pw0 = float(writer.pages[0].mediabox.width)
     ph0 = float(writer.pages[0].mediabox.height)
     c = canvas.Canvas(app_buf, pagesize=(pw0, ph0))
     W, H = pw0, ph0
     x, y = 60, H - 60
+    text_width = W - 120
+
+    media_map = build_media_map(media)
 
     if overflow:
         c.setFont("Helvetica-Bold", 14)
@@ -494,86 +632,29 @@ def fill_trec_form(template_path: Path, data: Dict[str, Any], output_path: Path)
         y -= 24
         c.setFont(FIXED_FONT, FIXED_SIZE)
 
-        def block(txt: str, width: float, y0: float) -> float:
-            tb = BytesIO(); tc = canvas.Canvas(tb, pagesize=(pw0, ph0))
-            lines = wrap_text(txt, tc, width)
-            for ln in lines:
-                if y0 < 60:
-                    c.showPage(); c.setFont(FIXED_FONT, FIXED_SIZE)
-                    y0 = H - 60
-                c.drawString(x, y0, ln)
-                y0 -= LINE_HEIGHT
+        def rich_block(txt: str, width: float, y0: float) -> float:
+            paras = (txt or "").split("\n")
+            for pi, para in enumerate(paras):
+                if para.strip() == "":
+                    if y0 < 60:
+                        c.showPage(); c.setFont(FIXED_FONT, FIXED_SIZE)
+                        y0 = H - 60
+                    y0 -= LINE_HEIGHT
+                    continue
+                y0 = draw_inline_richblock(c, para, width, x, y0, W, H, media_map)
             return y0
 
         for it in overflow:
             head = " — ".join([s for s in [f"{it.get('sectionNumber','')}. {it.get('section','')}".strip(". "), it.get('title','')] if s])
             if head:
-                y = block(head, W - 120, y)
+                c.setFont("Helvetica-Bold", 11)
+                y = draw_inline_richblock(c, head, text_width, x, y, W, H, media_map)
+                c.setFont(FIXED_FONT, FIXED_SIZE)
             if it.get("text"):
-                y = block(it["text"], W - 120, y)
+                y = rich_block(it["text"], text_width, y)
             y -= LINE_HEIGHT/2
 
-    if media:
-        if y < 120:
-            c.showPage(); y = H - 60
-        c.setFont("Helvetica-Bold", 14); c.drawString(x, y, "Media (in JSON order)")
-        y -= 24; c.setFont(FIXED_FONT, FIXED_SIZE)
-
-        col_w = 2.9 * inch
-        col_h = 2.1 * inch
-        cols = [x, x + col_w + 24]
-        col = 0
-
-        for i, m in enumerate(media, start=1):
-            kind, url = m.get("kind"), m.get("url", "")
-            if kind == "photo":
-                img = fetch_image(url, max_size=MAX_IMAGE_SIZE)
-                if img:
-                    try:
-                        iw, ih = getattr(img, "_image", getattr(img, "image", None)).size
-                    except Exception:
-                        iw, ih = (800, 600)
-                    scale = min(col_w/iw, col_h/ih)
-                    rw, rh = iw * scale, ih * scale
-                    if y - rh - 18 < 60:
-                        c.showPage(); y = H - 60; c.setFont(FIXED_FONT, FIXED_SIZE)
-                        c.setFont("Helvetica-Bold", 14); c.drawString(x, y, "Media (in JSON order)")
-                        y -= 24; c.setFont(FIXED_FONT, FIXED_SIZE); col = 0
-                    cx = cols[col]
-                    c.setFont("Helvetica-Bold", 10); c.drawString(cx, y, f"M#{i}: photo"); y -= 12
-                    c.drawImage(img, cx, y - rh, width=rw, height=rh, preserveAspectRatio=True, mask='auto')
-                    if col == 1:
-                        y = y - rh - 16
-                    col = 1 - col
-                    if col == 0:
-                        y -= 12
-                else:
-                    if y < 70:
-                        c.showPage(); y = H - 60; c.setFont(FIXED_FONT, FIXED_SIZE)
-                        c.setFont("Helvetica-Bold", 14); c.drawString(x, y, "Media (in JSON order)")
-                        y -= 24; c.setFont(FIXED_FONT, FIXED_SIZE)
-                    c.drawString(x, y, f"M#{i}: photo (unavailable)  {url}")
-                    y -= LINE_HEIGHT
-            else:
-                if y < 70:
-                    c.showPage(); y = H - 60; c.setFont(FIXED_FONT, FIXED_SIZE)
-                    c.setFont("Helvetica-Bold", 14); c.drawString(x, y, "Media (in JSON order)")
-                    y -= 24; c.setFont(FIXED_FONT, FIXED_SIZE)
-                label = f"M#{i}: video"
-                c.setFillColor(HexColor("#0645AD")); c.drawString(x, y, label)
-                tw = c.stringWidth(label, FIXED_FONT, FIXED_SIZE)
-                c.linkURL(url, (x, y - 2, x + tw, y + 10), relative=0)
-                c.setFillColor(black)
-                y -= LINE_HEIGHT
-                tb = BytesIO(); tc = canvas.Canvas(tb, pagesize=(pw0, ph0))
-                for ln in wrap_text(url, tc, (W - 120) - (tw + 8)):
-                    if y < 60:
-                        c.showPage(); y = H - 60; c.setFont(FIXED_FONT, FIXED_SIZE)
-                    c.drawString(x + tw + 8, y, ln)
-                    y -= LINE_HEIGHT
-
     c.showPage(); c.save(); app_buf.seek(0)
-
     app_reader = PdfReader(app_buf)
     for pg in app_reader.pages:
         writer.add_page(pg)
@@ -597,7 +678,7 @@ def main():
     tpl_path = Path(os.environ.get("TREC_TEMPLATE", here / "TREC_Template_Blank.pdf"))
     out_path = Path(os.environ.get("OUT_PATH", here / "TREC_Filled_Output.pdf"))
 
-    print("\n=== TREC Inspection Report PDF Generator (header-first, overlap-safe) ===\n")
+    print("\n=== TREC Inspection Report PDF Generator (header-first, overlap-safe, inline media) ===\n")
     with open(json_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
     data = raw.get("inspection", raw)
