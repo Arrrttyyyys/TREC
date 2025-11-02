@@ -676,7 +676,8 @@ def main():
     here = Path(__file__).parent
     json_path = Path(os.environ.get("JSON_PATH", here / "inspection.json"))
     tpl_path = Path(os.environ.get("TREC_TEMPLATE", here / "TREC_Template_Blank.pdf"))
-    out_path = Path(os.environ.get("OUT_PATH", here / "TREC_Filled_Output.pdf"))
+    out_path = Path(os.environ.get("OUT_PATH", here / "output_pdf.pdf"))
+
 
     print("\n=== TREC Inspection Report PDF Generator (header-first, overlap-safe, inline media) ===\n")
     with open(json_path, "r", encoding="utf-8") as f:
